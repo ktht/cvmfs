@@ -273,8 +273,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   ProxyInfo *ChooseProxyUnlocked(const shash::Any *hash);
   void UpdateProxiesUnlocked(const std::string &reason);
   void RebalanceProxiesUnlocked(const std::string &reason);
-  CURL *AcquireCurlHandle();
-  void ReleaseCurlHandle(CURL *handle);
+  CURL *AcquireCurlHandle(bool is_easy_handle);
+  void ReleaseCurlHandle(CURL *handle, bool is_easy_handle);
   void ReleaseCredential(JobInfo *info);
   void InitializeRequest(JobInfo *info, CURL *handle);
   void SetUrlOptions(JobInfo *info);
@@ -303,8 +303,8 @@ class DownloadManager {  // NOLINT(clang-analyzer-optin.performance.Padding)
   }
 
   Prng prng_;
-  std::set<CURL *> *pool_handles_idle_;
-  std::set<CURL *> *pool_handles_inuse_;
+  std::map<bool, std::set<CURL *> *> pool_handles_idle_;
+  std::map<bool, std::set<CURL *> *> pool_handles_inuse_;
   uint32_t pool_max_handles_;
   CURLM *curl_multi_;
   HeaderLists *header_lists_;

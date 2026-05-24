@@ -634,7 +634,7 @@ void *DownloadManager::MainDownload(void *data) {
       if (!still_running) {
         gettimeofday(&timeval_start, NULL);
       }
-      CURL *handle = download_mgr->AcquireCurlHandle();
+      CURL *handle = download_mgr->AcquireCurlHandle(false);
       download_mgr->InitializeRequest(info, handle);
       download_mgr->SetUrlOptions(info);
       curl_multi_add_handle(download_mgr->curl_multi_, handle);
@@ -698,7 +698,7 @@ void *DownloadManager::MainDownload(void *data) {
                                    &still_running);
         } else {
           // Return easy handle into pool and write result back
-          download_mgr->ReleaseCurlHandle(easy_handle);
+          download_mgr->ReleaseCurlHandle(easy_handle, false);
 
           DataTubeElement *ele = new DataTubeElement(kActionStop);
           info->GetDataTubePtr()->EnqueueBack(ele);
@@ -709,14 +709,14 @@ void *DownloadManager::MainDownload(void *data) {
     }
   }
 
-  for (set<CURL *>::iterator i = download_mgr->pool_handles_inuse_->begin(),
-                             iEnd = download_mgr->pool_handles_inuse_->end();
+  for (set<CURL *>::iterator i = download_mgr->pool_handles_inuse_[false]->begin(),
+                             iEnd = download_mgr->pool_handles_inuse_[false]->end();
        i != iEnd;
        ++i) {
     curl_multi_remove_handle(download_mgr->curl_multi_, *i);
     curl_easy_cleanup(*i);
   }
-  download_mgr->pool_handles_inuse_->clear();
+  download_mgr->pool_handles_inuse_[false]->clear();
   free(download_mgr->watch_fds_);
 
   LogCvmfs(kLogDownload, kLogDebug,
@@ -874,10 +874,10 @@ string DownloadManager::ProxyInfo::Print() {
  * Gets an idle CURL handle from the pool. Creates a new one and adds it to
  * the pool if necessary.
  */
-CURL *DownloadManager::AcquireCurlHandle() {
+CURL *DownloadManager::AcquireCurlHandle(bool is_easy_handle) {
   CURL *handle;
 
-  if (pool_handles_idle_->empty()) {
+  if (pool_handles_idle_[is_easy_handle]->empty()) {
     // Create a new handle
     handle = curl_easy_init();
     assert(handle != NULL);
@@ -887,27 +887,27 @@ CURL *DownloadManager::AcquireCurlHandle() {
     curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, CallbackCurlHeader);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, CallbackCurlData);
   } else {
-    handle = *(pool_handles_idle_->begin());
-    pool_handles_idle_->erase(pool_handles_idle_->begin());
+    handle = *(pool_handles_idle_[is_easy_handle]->begin());
+    pool_handles_idle_[is_easy_handle]->erase(pool_handles_idle_[is_easy_handle]->begin());
   }
 
-  pool_handles_inuse_->insert(handle);
+  pool_handles_inuse_[is_easy_handle]->insert(handle);
 
   return handle;
 }
 
 
-void DownloadManager::ReleaseCurlHandle(CURL *handle) {
-  const set<CURL *>::iterator elem = pool_handles_inuse_->find(handle);
-  assert(elem != pool_handles_inuse_->end());
+void DownloadManager::ReleaseCurlHandle(CURL *handle, bool is_easy_handle) {
+  const set<CURL *>::iterator elem = pool_handles_inuse_[is_easy_handle]->find(handle);
+  assert(elem != pool_handles_inuse_[is_easy_handle]->end());
 
-  if (pool_handles_idle_->size() > pool_max_handles_) {
+  if (pool_handles_idle_[is_easy_handle]->size() > pool_max_handles_) {
     curl_easy_cleanup(*elem);
   } else {
-    pool_handles_idle_->insert(*elem);
+    pool_handles_idle_[is_easy_handle]->insert(*elem);
   }
 
-  pool_handles_inuse_->erase(elem);
+  pool_handles_inuse_[is_easy_handle]->erase(elem);
 }
 
 
@@ -1824,15 +1824,16 @@ DownloadManager::~DownloadManager() {
     pipe_jobs_.Destroy();
   }
 
-  for (set<CURL *>::iterator i = pool_handles_idle_->begin(),
-                             iEnd = pool_handles_idle_->end();
-       i != iEnd;
-       ++i) {
-    curl_easy_cleanup(*i);
+  for (bool is_easy_handle: { true, false }) {
+    for (set<CURL *>::iterator i = pool_handles_idle_[is_easy_handle]->begin(),
+                               iEnd = pool_handles_idle_[is_easy_handle]->end();
+         i != iEnd;
+         ++i) {
+      curl_easy_cleanup(*i);
+    }
+    delete pool_handles_idle_[is_easy_handle];
+    delete pool_handles_inuse_[is_easy_handle];
   }
-
-  delete pool_handles_idle_;
-  delete pool_handles_inuse_;
   curl_multi_cleanup(curl_multi_);
 
   delete header_lists_;
@@ -1881,8 +1882,8 @@ DownloadManager::DownloadManager(const unsigned max_pool_handles,
                                  const perf::StatisticsTemplate &statistics,
                                  const std::string &name)
     : prng_(Prng())
-    , pool_handles_idle_(new set<CURL *>)
-    , pool_handles_inuse_(new set<CURL *>)
+    , pool_handles_idle_({ {true, new set<CURL *>}, {false, new set<CURL *>}})
+    , pool_handles_inuse_({ {true, new set<CURL *>}, {false, new set<CURL *>}})
     , pool_max_handles_(max_pool_handles)
     , pipe_terminate_(NULL)
     , pipe_jobs_(NULL)
@@ -2055,7 +2056,7 @@ Failures DownloadManager::Fetch(JobInfo *info) {
     // LogCvmfs(kLogDownload, kLogDebug, "got result %d", result);
   } else {
     const MutexLockGuard l(lock_synchronous_mode_);
-    CURL *handle = AcquireCurlHandle();
+    CURL *handle = AcquireCurlHandle(true);
     InitializeRequest(info, handle);
     SetUrlOptions(info);
     // curl_easy_setopt(handle, CURLOPT_VERBOSE, 1);
@@ -2071,7 +2072,7 @@ Failures DownloadManager::Fetch(JobInfo *info) {
       }
     } while (VerifyAndFinalize(retval, info));
     result = info->error_code();
-    ReleaseCurlHandle(info->curl_handle());
+    ReleaseCurlHandle(info->curl_handle(), true);
   }
 
   if (result != kFailOk) {
